@@ -186,6 +186,12 @@ function computeLayout() {
 
 const params = new URLSearchParams(location.search);
 const pinnedRunId = params.get('run');
+// `?replay=1` — SCREENING mode. The projector normally shows only duels that
+// are still live, which is right during a tournament and wrong when an
+// instructor wants to put finished battles on a wall for a class. Without
+// this, staging a reel of recorded duels renders "NO LIVE DUEL" forever,
+// because every one of them has ended.
+const REPLAY = params.get('replay') === '1';
 let runId = pinnedRunId;
 
 let tState = { run_id: null, standings: null, bracket: null, duels: [], featured: null };
@@ -505,7 +511,7 @@ function updateFeatured(data) {
   // duel_end, so filtering first would drop it and this would then
   // promote a stale earlier round as "still live").
   const raw = Array.isArray(data.duels) ? data.duels : [];
-  const duels = dedupeDuelsByCurrentRound(raw).filter((d) => !duelEnded(d));
+  const duels = dedupeDuelsByCurrentRound(raw).filter((d) => REPLAY || !duelEnded(d));
   resolveDuelNames(duels);
   trackHpHistory(duels, now);
   const chosenId = pickFeatured(duels, data.featured, featuredDuelId, featuredLastSwitchAt, now);
@@ -817,7 +823,7 @@ function drawWaitingCard(ctx, rect, t) {
 
 function drawNoLiveDuel(ctx, rect, t) {
   const cx = rect.x + rect.w / 2, cy = rect.y + rect.h / 2;
-  const label = 'NO LIVE DUEL';
+  const label = REPLAY ? 'NO DUELS IN THIS RUN' : 'NO LIVE DUEL';
   const scale = 3;
   const w = widgets.measurePixelText(ctx, label, scale);
   widgets.drawPixelText(ctx, cx - w / 2, cy - 4, label, theme.COLORS.textDim, scale);
@@ -1025,7 +1031,7 @@ function drawTickerPane(ctx, rect, t) {
   const scale = 1;
   const raw = Array.isArray(tState.duels) ? tState.duels : [];
   const duels = dedupeDuelsByCurrentRound(raw)
-    .filter((d) => !duelEnded(d))
+    .filter((d) => REPLAY || !duelEnded(d))
     .sort((a, b) => String(duelIdentity(a)).localeCompare(String(duelIdentity(b))));
   const y = rect.y + Math.floor((rect.h - 7 * scale) / 2);
 
