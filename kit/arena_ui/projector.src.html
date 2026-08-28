@@ -55,6 +55,7 @@ import * as decode from './core/decode.js';
 import * as reduce from './core/reduce.js';
 import * as sprites from './core/sprites.js';
 import * as widgets from './core/widgets.js';
+import * as camera from './core/camera.js';
 
 // ---------------------------------------------------------------------------
 // tiny local helpers (deliberately NOT re-exported from core/ — each is a
@@ -364,16 +365,16 @@ async function fetchDuelNames(d) {
 }
 
 function duelScore(d, now) {
+  // Policy lives in core/camera.js so it can be tested; this is only the
+  // wiring that turns a /state entry into that function's inputs.
   const hp = duelHp(d);
-  const hpA = numOr(hp.A, 100), hpB = numOr(hp.B, 100);
-  const closeness = 100 - Math.abs(hpA - hpB); // 0..100, higher = a closer fight
   const hist = hpHistory.get(duelIdentity(d));
-  let hitBonus = 0;
-  if (hist && typeof hist.hitAt === 'number') {
-    const age = now - hist.hitAt;
-    if (age >= 0 && age < 6000) hitBonus = 40 * (1 - age / 6000); // "just took the biggest hit"
-  }
-  return closeness + hitBonus;
+  const hitAt = hist && typeof hist.hitAt === 'number' ? hist.hitAt : null;
+  return camera.scoreDuel({
+    hpA: numOr(hp.A, 100),
+    hpB: numOr(hp.B, 100),
+    hitAgeMs: hitAt === null ? null : now - hitAt,
+  });
 }
 
 function trackHpHistory(duels, now) {
