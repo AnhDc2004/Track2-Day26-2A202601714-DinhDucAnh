@@ -361,33 +361,63 @@ def main(argv=None) -> int:
         hp_bot -= d_you["recoil"]
         hp_you, hp_bot = max(0, hp_you), max(0, hp_bot)
 
-        # L1 domain facts from YOUR side's defence, then L2 referee decisions, then L3
-        # match state — the layering CONTRACTS.md 5 requires, so the ledger and the UI
-        # never read the same event for different purposes.
+        # L1 domain facts from BOTH defences, then L2 referee decisions, then L3 match
+        # state — the layering CONTRACTS.md 5 requires, so the ledger and the UI never
+        # read the same event for different purposes.
+        #
+        # TWO NUMBERING SYSTEMS USED TO GET CROSSED HERE. Each `_exchange` numbers its
+        # own trace from 0, and the referee's evidence refs are cut against THAT. The
+        # file this loop writes is one continuous stream across all ten rounds. The
+        # previous version emitted `evt:{m['seq']:04d}` straight from the per-exchange
+        # number into the global stream, so a claim in round 4 pointed at whatever
+        # happened to be event 16 of the whole duel — a real event, in the wrong round,
+        # belonging to the wrong side. Every L1 event now carries `_src`, and the refs
+        # are remapped onto the global stream just before the file is written.
+        #
+        # And only ONE side's trace used to be written at all (yours), while
+        # `latent_violation` refs point into the OPPONENT's trace — so those refs could
+        # never resolve even in principle. Both traces are written now.
+        def _add_l1(side, trace):
+            for e in trace:
+                if e["type"] in ("command", "enforced", "tool_call", "tool_result",
+                                 "mutation", "answer", "integrity"):
+                    events_for_ui.append({"layer": 1, "type": e["type"], "side": side,
+                                          "round": r, "_src": [side, r, e["seq"]],
+                                          **e["p"]})
+
         events_for_ui.append({"layer": 1, "type": "exchange_start", "side": "A",
                               "round": r, "attacker": a.bot, "defender": "you",
                               "card_id": bot_card.get("id"), "ask": bot_card.get("ask")})
-        for e in d_you["trace"]:
-            if e["type"] in ("command", "enforced", "tool_call", "mutation", "answer",
-                             "integrity"):
-                events_for_ui.append({"layer": 1, "type": e["type"], "side": "A",
-                                      "round": r, **e["p"]})
+        _add_l1("A", d_you["trace"])
+        events_for_ui.append({"layer": 1, "type": "exchange_start", "side": "B",
+                              "round": r, "attacker": "you", "defender": a.bot,
+                              "card_id": you_card.get("id"), "ask": you_card.get("ask")})
+        _add_l1("B", d_bot["trace"])
+
+        def _claim(side, ref_side, c, outcome, scaled):
+            events_for_ui.append({"layer": 2, "type": "claim_outcome", "side": side,
+                                  "producer": "referee", "round": r, "cls": c["cls"],
+                                  "_ev_src": [ref_side, r, list(c.get("evidence", []))],
+                                  "outcome": outcome, "weight": weight_of(c["cls"]),
+                                  "scaled": scaled})
+
+        # All FOUR outcome categories. The previous version wrote only what was proved
+        # against you and what you filed falsely — your own upheld claims never reached
+        # the log at all, which makes a round you won look like a round nobody argued.
         for c in d_you["verified"]:
-            events_for_ui.append({"layer": 2, "type": "claim_outcome", "side": "B",
-                                  "producer": "referee", "round": r, "cls": c["cls"],
-                                  "evidence": c.get("evidence", []), "outcome": "verified",
-                                  "weight": weight_of(c["cls"]),
-                                  "scaled": round(weight_of(c["cls"]) * round_scale(r))})
+            _claim("B", "A", c, "verified", round(weight_of(c["cls"]) * round_scale(r)))
+        for c in d_bot["verified"]:
+            _claim("A", "B", c, "verified", round(weight_of(c["cls"]) * round_scale(r)))
         for c in d_bot["false"]:
-            events_for_ui.append({"layer": 2, "type": "claim_outcome", "side": "A",
-                                  "producer": "referee", "round": r, "cls": c["cls"],
-                                  "evidence": c.get("evidence", []), "outcome": "false",
-                                  "weight": weight_of(c["cls"]),
-                                  "scaled": -round(0.8 * weight_of(c["cls"]) * round_scale(r))})
+            _claim("A", "B", c, "false",
+                   -round(0.8 * weight_of(c["cls"]) * round_scale(r)))
+        for c in d_you["false"]:
+            _claim("B", "A", c, "false",
+                   -round(0.8 * weight_of(c["cls"]) * round_scale(r)))
         for m in d_bot["missed"]:
             events_for_ui.append({"layer": 2, "type": "latent_violation", "side": "B",
                                   "producer": "referee", "round": r, "cls": m["cls"],
-                                  "evidence": [f"evt:{m['seq']:04d}"],
+                                  "_ev_src": ["B", r, [f"evt:{m['seq']:04d}"]],
                                   "weight": weight_of(m["cls"])})
         events_for_ui.append({"layer": 3, "type": "hp", "producer": "referee",
                               "round": r, "A": hp_you, "B": hp_bot})
@@ -437,6 +467,34 @@ def main(argv=None) -> int:
         # (CONTRACTS.md 10), so writing only a summary would have produced a server that
         # answers 200 and an arena that renders an empty canvas — the most annoying
         # possible failure, because everything "works".
+        # Global seq == position in `events_for_ui`, because `put` below emits one line
+        # per entry in order. Build the map first, then rewrite every evidence ref
+        # through it, then drop the bookkeeping keys.
+        seq_map = {}
+        for i, entry in enumerate(events_for_ui):
+            src = entry.get("_src")
+            if src:
+                seq_map[(src[0], src[1], src[2])] = i
+        for entry in events_for_ui:
+            ev_src = entry.pop("_ev_src", None)
+            entry.pop("_src", None)
+            if ev_src is None:
+                continue
+            side, rnd, refs = ev_src
+            mapped = []
+            for ref in refs:
+                if isinstance(ref, str) and ref.startswith("evt:"):
+                    try:
+                        local = int(ref[4:])
+                    except ValueError:
+                        mapped.append(ref)
+                        continue
+                    g = seq_map.get((side, rnd, local))
+                    mapped.append(f"evt:{g:04d}" if g is not None else ref)
+                else:
+                    mapped.append(ref)
+            entry["evidence"] = mapped
+
         seq = 0
         with (run_dir / "events.jsonl").open("w", encoding="utf8") as fh:
             def put(layer, type, side=None, producer="arena", **p):  # noqa: A002

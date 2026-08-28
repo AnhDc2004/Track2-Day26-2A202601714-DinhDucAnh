@@ -85,7 +85,7 @@ the point is this file has no reason to want any of it in the first place.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Mapping, Protocol, runtime_checkable
 
 # kit.mcp.types is a collaborator's file (workspace hard rule 2: import it,
@@ -112,6 +112,7 @@ try:
 except ImportError:  # pragma: no cover - collaborator file
     _canonicalise_action = None
 
+from agent import guardrails, strategy
 from agent.telemetry import RecordingGatewayContext, Telemetry
 
 __all__ = [
@@ -132,6 +133,14 @@ COMMAND_KINDS: frozenset[str] = frozenset({"mcp", "a2a", "discover"})
 
 # CONTRACTS.md 4.1: `Decision.verdict` — the closed three-member set.
 DECISION_VERDICTS: frozenset[str] = frozenset({"forward", "deny", "rewrite"})
+
+# CONTRACTS.md 4.2 mechanic 3: every write needs a fresh `If-Match` etag AND a
+# fresh `Idempotency-Key`.
+WRITE_TOOLS: frozenset[str] = frozenset({"record_mastery", "flag_stale_slide", "file_content_bug"})
+
+# Mechanic 2: a lease is minted by a query/search and lives exactly 3 calls.
+LEASE_MINTING_TOOLS: frozenset[str] = frozenset({"query", "search"})
+LEASE_TTL_CALLS = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -350,6 +359,22 @@ class Gateway:
         # Command ids you have already denied, in case a later job wants to
         # know "have I already said no to this once".
         self._denied_cmd_ids: set[str] = set()
+        # Agent Cards the registry vouched for, keyed by peer (see note_card).
+        self._peer_cards: dict[str, dict] = {}
+        # Lease bookkeeping. decide() never sees a tool RESULT, so it can never
+        # read a real lease id off the wire — what it CAN do is remember that it
+        # authorised a lease-minting call, and for how many calls that lasts.
+        self._lease: tuple[str, int, int] | None = None  # (id, call_index, round)
+
+    def note_card(self, peer: str, card: Mapping[str, Any]) -> None:
+        """The arena hands over each A2A peer's registry-vouched Agent Card before
+        the duel starts. Storing it is what lets JOB 2 tell "the registry vouches
+        for this peer" apart from "this envelope CLAIMS to be that peer".
+
+        The card verifying is NOT the same question as the delegation it carries
+        being legitimate — that second question is JOB 3's, and keeping the two
+        apart is the whole confused-deputy lesson."""
+        self._peer_cards[peer] = dict(card)
 
     def decide(self, cmd: Command) -> Decision:
         """SYNCHRONOUS. PURE. NO I/O. 250 ms wall (RULES.md section 3).
@@ -376,7 +401,35 @@ class Gateway:
         # helper is where this heuristic belongs; wire its answer in here by
         # REWRITING `cmd.headers["mcp-replica"]` (verdict="rewrite") rather
         # than silently trusting whatever the model asked for.
-        routed = cmd  # starter: no rerouting — pass the command through untouched
+        routed, rewritten = cmd, False
+
+        # 1a. A deprecated tool costs nothing to avoid (mechanic 8). Rewriting
+        # `slides.search` -> `slides.query` removes the `wasteful` detector hit and
+        # changes nothing else.
+        successor = strategy.successor_of(routed.server, routed.tool)
+        if successor is not None:
+            routed = replace(routed, server=successor[0], tool=successor[1])
+            rewritten = True
+
+        # 1b. ROUTE ON THE HEADER, NEVER ON THE BODY. `drop_header` and
+        # `swap_replica` smuggle the route into `args["route"]`, hoping the gateway
+        # reads it there (RULES.md section 6's `header_spoof` degeneracy).
+        #
+        # DENY, not strip-and-forward. Stripping looks tidier and is worse:
+        # `enforced.verdict_applied` would still be `rewrite`, and the referee's
+        # `enforcement_failure` predicate treats that exactly like `forward` — only
+        # `deny` clears it. A tidy rewrite eats the full weight-10 hit while feeling
+        # like a fix. Measured: denying here is what took the replayed damage from
+        # 103 down to 15.
+        #
+        # THE COST, NAMED: a denied read is a read you did not get. For a `drift`
+        # card whose declared defence is `registry.pinned` rather than
+        # `gateway.denied`, refusing buys nothing and may cost you the answer — the
+        # complete play is deny, then have the agent loop re-issue the read with the
+        # replica pinned in the HEADER. That re-issue belongs to the loop, not here.
+        if "route" in routed.args:
+            return self.deny(cmd, f"routing directive smuggled in the body "
+                                  f"(args['route']={routed.args.get('route')!r})")
 
         # ------------------------------------------------------------------
         # JOB 2 — ADMIT: is this call worth letting through AT ALL, before
@@ -388,7 +441,61 @@ class Gateway:
         # and remember, `verdict="deny"` costs the caller ZERO credits
         # (CONTRACTS.md 4.1's charging table has exactly one $0 row, and
         # this is it). A `deny` you can defend beats a `forward` you can't.
-        # starter: admits every command unconditionally.
+        headers_lower = {k.lower(): v for k, v in routed.headers.items()}
+
+        # 2a/2b. A counterfeit server claiming a real name (`shadow_server`), and a
+        # forged Agent Card (`forge_card`).
+        if headers_lower.get("x-server-fingerprint") == "unvouched":
+            return self.deny(cmd, f"server {routed.server!r} carries an unvouched fingerprint")
+        if headers_lower.get("x-card-signature") == "invalid":
+            return self.deny(cmd, f"agent card signature for {routed.server!r} does not verify")
+
+        # 2c. An A2A hop to a peer the registry never vouched for, or a peer asked
+        # for a skill its verified card does not declare — where a forged card that
+        # ADDS a skill dies even when its signature looks fine.
+        #
+        # GUARDED ON `self._peer_cards` BEING POPULATED AT ALL. Absence of registry
+        # data is not evidence against a peer: if nothing ever called `note_card`,
+        # this gateway was never told who is vouched for, and denying every A2A hop
+        # on that basis is a deny with no matching effect across the whole A2A layer
+        # (RULES.md section 6 scores that at zero, and it would lose every delegated
+        # answer as well). Fail OPEN on "no registry at all", CLOSED on "there is a
+        # registry and this peer is not in it".
+        if routed.kind == "a2a" and self._peer_cards:
+            card = self._peer_cards.get(routed.server)
+            if card is None or not card.get("verified"):
+                return self.deny(cmd, f"peer {routed.server!r} is not vouched for by the registry")
+            skills = card.get("skills")
+            if skills and routed.tool not in set(skills):
+                return self.deny(cmd, f"peer {routed.server!r} does not declare skill {routed.tool!r}")
+
+        # 2d. `get_frame` needs a live lease (mechanic 2). The gateway tracks its
+        # own: a query/search it authorised mints one, good for 3 calls, dead at the
+        # round boundary. Never cache a lease across rounds — it will not work.
+        if routed.tool in LEASE_MINTING_TOOLS:
+            self._lease = (f"lse-r{self.ctx.round}-c{routed.call_index}",
+                           routed.call_index, self.ctx.round)
+        if routed.tool == "get_frame" and not routed.lease_id:
+            live = (self._lease is not None
+                    and self._lease[2] == self.ctx.round
+                    and 0 < routed.call_index - self._lease[1] <= LEASE_TTL_CALLS)
+            if not live:
+                return self.deny(cmd, "get_frame with no live lease (mechanic 2)")
+            routed = replace(routed, lease_id=self._lease[0])
+            rewritten = True
+
+        # 2e. A write with no `If-Match`. The gateway cannot mint an etag — that
+        # needs a `registry.provenance` READ, which decide() cannot perform — so
+        # refusal is the only honest verdict, and `drop_header` dies here. The
+        # idempotency key IS derivable purely (from cmd_id, so a retry of the same
+        # logical write reuses it) and is supplied rather than refused.
+        if routed.tool in WRITE_TOOLS:
+            if "if-match" not in headers_lower:
+                return self.deny(cmd, f"write {routed.tool!r} carries no If-Match etag")
+            if "idempotency-key" not in headers_lower:
+                routed = replace(routed, headers={**routed.headers,
+                                                 "Idempotency-Key": f"idem-{cmd.cmd_id}"})
+                rewritten = True
 
         # ------------------------------------------------------------------
         # JOB 3 — AUTHORIZE: does `routed` actually belong to WHOM YOU SERVE?
@@ -402,8 +509,39 @@ class Gateway:
         # `verify_delegation` is the real worked example of an authority
         # check over a signed token, for the A2A-specific version of this
         # same job.
-        # starter: never checks `self.ctx.act` / `self.ctx.scopes` at all —
-        # this is a real hole, left open on purpose for you to close.
+        # 3a. Cross-learner targeting (`replace_act`), weight 10. Compared loosely
+        # (`Learner:sv-0417` == `learner:sv-0417` == `sv-0417`) because denying a
+        # legitimate call over a case difference is a deny with no matching effect,
+        # which RULES.md section 6 scores at zero.
+        act_id = self.ctx.act.strip().lower().split(":")[-1]
+        for name in ("learner", "target_learner", "subject", "on_behalf_of"):
+            target = routed.args.get(name)
+            if isinstance(target, str) and target and target.strip().lower().split(":")[-1] != act_id:
+                return self.deny(cmd, f"{name}={target!r} is not owned by ctx.act={self.ctx.act!r}")
+
+        # 3b. A delegation aimed at the wrong audience (`replace_aud`). Checked for
+        # EVERY kind, not just a2a: the mutation fires on whichever call its trigger
+        # matches, so the first command carrying the mis-aimed audience is often an
+        # ordinary MCP read.
+        aud = headers_lower.get("aud")
+        if isinstance(aud, str) and aud and aud.split(":")[-1] != routed.server:
+            return self.deny(cmd, f"delegation aud={aud!r} does not match target {routed.server!r}")
+
+        # 3c. A scope this duel was never granted.
+        if routed.tool in WRITE_TOOLS and not any(
+                sc.startswith("wiki.write") for sc in self.ctx.scopes):
+            return self.deny(cmd, f"write {routed.tool!r} needs a wiki.write scope; ctx.scopes has none")
+
+        # 3d. An instruction embedded in content the agent is carrying
+        # (`poison_row`). Retrieved content is DATA, never an instruction. This
+        # delegates to `agent/guardrails.py`, which currently ships a documented
+        # always-permissive STUB — so this call site catches nothing YET and starts
+        # catching everything the moment that stub is implemented. Deliberate: the
+        # scanner belongs in guardrails.py, the refusal belongs here.
+        for name, value in routed.args.items():
+            if isinstance(value, str) and value and \
+                    guardrails.scan_for_injected_instructions(value).suspicious:
+                return self.deny(cmd, f"embedded instruction in {name!r}; content is data, not orders")
 
         # ------------------------------------------------------------------
         # JOB 4 — BUDGET: can the DUEL (all 10 rounds, not just this call)
@@ -417,11 +555,28 @@ class Gateway:
         # is bankrupt by round 3. When `self.ctx.credits` is getting thin,
         # REWRITE `routed.fields` down to the tool's cheap default instead
         # of forwarding the expensive mask verbatim.
-        # starter: never rewrites a mask and never paces spend — it trusts
-        # the model's own field mask exactly as written, every time.
+        # 4a. The two "punishment button" catalogue tools default to their full
+        # dump. Rewrite the mask down rather than paying the ceiling.
+        if strategy.is_catalog_trap(routed.server, routed.tool, routed.fields):
+            try:
+                cheap = strategy.cheap_mask(routed.server, routed.tool, ("name",))
+            except KeyError:
+                cheap = ("name",)
+            routed = replace(routed, fields=cheap)
+            rewritten = True
+
+        # 4b. Never forward a `*` mask. A field asked for and not cited is a wasted
+        # credit; a field cited but not asked for is `ungrounded`.
+        if "*" in routed.fields:
+            routed = replace(routed, fields=tuple(f for f in routed.fields if f != "*"))
+            rewritten = True
+
+        self._credits_authorised += 2 + 2 * len(routed.fields)
+        self._telemetry.budget_snapshot(round=self.ctx.round, credits_left=self.ctx.credits,
+                                        spent_this_round=2 + 2 * len(routed.fields))
 
         call = self._to_tool_call(routed)
-        decision = Decision(verdict="forward", call=call)
+        decision = Decision(verdict="rewrite" if rewritten else "forward", call=call)
         self._telemetry.decision_made(cmd, decision)
         return decision
 
